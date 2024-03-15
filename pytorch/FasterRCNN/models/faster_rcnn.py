@@ -77,6 +77,15 @@ class FasterRCNNModel(nn.Module):
       backbone = backbone
     )
 
+    self._stage2_region_proposal_network2 = rpn.RegionProposalNetwork(
+      feature_map_channels=backbone.feature_map_channels,
+      allow_edge_proposals=allow_edge_proposals
+    )
+    self._stage3_detector_network2 = detector.DetectorNetwork(
+      num_classes=num_classes,
+      backbone=backbone
+    )
+
   def forward(self, image_data, anchor_map = None, anchor_valid_map = None):
     """
     Forward inference. Use for test and evaluation only.
@@ -115,9 +124,11 @@ class FasterRCNNModel(nn.Module):
       anchor_map, anchor_valid_map = anchors.generate_anchor_maps(image_shape = image_shape, feature_map_shape = feature_map_shape, feature_pixels = self.backbone.feature_pixels)
 
     # Run each stage
-    feature_map = self._stage1_feature_extractor(image_data = image_data)
+    feature_map1, feature_map2 = self._stage1_feature_extractor(image_data = image_data)
+
+
     objectness_score_map, box_deltas_map, proposals = self._stage2_region_proposal_network(
-      feature_map = feature_map,
+      feature_map = feature_map1,
       image_shape = image_shape,
       anchor_map = anchor_map,
       anchor_valid_map = anchor_valid_map,
@@ -125,11 +136,24 @@ class FasterRCNNModel(nn.Module):
       max_proposals_post_nms = 300
     )
     classes, box_deltas = self._stage3_detector_network(
-      feature_map = feature_map,
+      feature_map = feature_map1,
       proposals = proposals
     )
 
-    return proposals, classes, box_deltas
+    objectness_score_map2, box_deltas_map2, proposals2 = self._stage2_region_proposal_network2(
+      feature_map=feature_map2,
+      image_shape=image_shape,
+      anchor_map=anchor_map,
+      anchor_valid_map=anchor_valid_map,
+      max_proposals_pre_nms=6000,  # test time values
+      max_proposals_post_nms=300
+    )
+    classes2, box_deltas2 = self._stage3_detector_network2(
+      feature_map=feature_map2,
+      proposals=proposals2
+    )
+
+    return proposals, classes, box_deltas, proposals2, classes2, box_deltas2
 
   @utils.no_grad
   def predict(self, image_data, score_threshold, anchor_map = None, anchor_valid_map = None):
@@ -167,11 +191,36 @@ class FasterRCNNModel(nn.Module):
     assert image_data.shape[0] == 1, "Batch size must be 1"
 
     # Forward inference
-    proposals, classes, box_deltas = self(
+
+    proposals, classes, box_deltas, proposals2, classes2, box_deltas2 = self(
       image_data = image_data,
       anchor_map = anchor_map,
       anchor_valid_map = anchor_valid_map
     )
+
+    exit_threshold = t.tensor([0.8],
+                              dtype=t.float32).to('cuda')
+    top = 0
+    with t.no_grad():
+      for i1 in classes :
+        pk = nn.functional.softmax(i1, dim=-1)
+        # print("pk : ", pk)
+        top1 = t.max(pk)
+        # print("top1 : ", top1)
+        # top1 = t.log(top1) * top1
+        # print("top1 : ", top1)
+        top += top1
+    print(top / len(classes))
+    if (top / len(classes) < exit_threshold).cpu().detach().numpy():
+      proposals = proposals2
+      classes= classes2
+      box_deltas = box_deltas2
+      print("convert 2")
+
+    # print("A : ", proposals)
+    # print("B : ", proposals2)
+
+
     proposals = proposals.cpu().numpy()
     classes = classes.cpu().numpy()
     box_deltas = box_deltas.cpu().numpy()
@@ -291,11 +340,11 @@ class FasterRCNNModel(nn.Module):
     image_shape = image_data.shape[1:]
 
     # Stage 1: Extract features
-    feature_map = self._stage1_feature_extractor(image_data = image_data)
+    feature_map1, feature_map2 = self._stage1_feature_extractor(image_data = image_data)
 
     # Stage 2: Generate object proposals using RPN
     rpn_score_map, rpn_box_deltas_map, proposals = self._stage2_region_proposal_network(
-      feature_map = feature_map,
+      feature_map = feature_map1,
       image_shape = image_shape,  # each image in batch has identical shape: (num_channels, height, width)
       anchor_map = anchor_map,
       anchor_valid_map = anchor_valid_map,
@@ -332,13 +381,59 @@ class FasterRCNNModel(nn.Module):
     gt_classes = gt_classes.detach()
     gt_box_deltas = gt_box_deltas.detach()
 
+
+
+
+
+    rpn_score_map2, rpn_box_deltas_map2, proposals2 = self._stage2_region_proposal_network2(
+      feature_map=feature_map2,
+      image_shape=image_shape,  # each image in batch has identical shape: (num_channels, height, width)
+      anchor_map=anchor_map,
+      anchor_valid_map=anchor_valid_map,
+      max_proposals_pre_nms=12000,
+      max_proposals_post_nms=2000
+    )
+
+    # Sample random mini-batch of anchors (for RPN training)
+
+    # Assign labels to proposals and take random sample (for detector training)
+    proposals2, gt_classes2, gt_box_deltas2 = self._label_proposals(
+      proposals=proposals2,
+      gt_boxes=gt_boxes[0],  # for now, batch size of 1
+      min_background_iou_threshold=0.0,
+      min_object_iou_threshold=0.5
+    )
+    proposals2, gt_classes2, gt_box_deltas2 = self._sample_proposals(
+      proposals=proposals2,
+      gt_classes=gt_classes2,
+      gt_box_deltas=gt_box_deltas2,
+      max_proposals=self._proposal_batch_size,
+      positive_fraction=0.25
+    )
+
+    # Make sure RoI proposals and ground truths are detached from computational
+    # graph so that gradients are not propagated through them. They are treated
+    # as constant inputs into the detector stage.
+    proposals2 = proposals2.detach()
+    gt_classes2 = gt_classes2.detach()
+    gt_box_deltas2 = gt_box_deltas2.detach()
+
+
+
+
+
+
     # Stage 3: Detector
     detector_classes, detector_box_deltas = self._stage3_detector_network(
-      feature_map = feature_map,
+      feature_map = feature_map1,
       proposals = proposals
     )
 
-    # Compute losses
+    detector_classes2, detector_box_deltas2 = self._stage3_detector_network2(
+      feature_map=feature_map2,
+      proposals=proposals2
+    )
+    # Compute losses1
     rpn_class_loss = rpn.class_loss(predicted_scores = rpn_score_map, y_true = gt_rpn_minibatch_map)
     rpn_regression_loss = rpn.regression_loss(predicted_box_deltas = rpn_box_deltas_map, y_true = gt_rpn_minibatch_map)
     detector_class_loss = detector.class_loss(predicted_classes = detector_classes, y_true = gt_classes)
@@ -352,14 +447,28 @@ class FasterRCNNModel(nn.Module):
       total = total_loss.detach().cpu().item()
     )
 
-    # Backprop
-    total_loss.backward()
+    #2
+    rpn_class_loss2 = rpn.class_loss(predicted_scores=rpn_score_map2, y_true=gt_rpn_minibatch_map)
+    rpn_regression_loss2 = rpn.regression_loss(predicted_box_deltas=rpn_box_deltas_map2, y_true=gt_rpn_minibatch_map)
+    detector_class_loss2 = detector.class_loss(predicted_classes=detector_classes2, y_true=gt_classes2)
+    detector_regression_loss2 = detector.regression_loss(predicted_box_deltas=detector_box_deltas2, y_true=gt_box_deltas2)
+    total_loss2 = rpn_class_loss2 + rpn_regression_loss2 + detector_class_loss2 + detector_regression_loss2
+    loss2 = FasterRCNNModel.Loss(
+      rpn_class=rpn_class_loss2.detach().cpu().item(),
+      rpn_regression=rpn_regression_loss2.detach().cpu().item(),
+      detector_class=detector_class_loss2.detach().cpu().item(),
+      detector_regression=detector_regression_loss2.detach().cpu().item(),
+      total=total_loss2.detach().cpu().item()
+    )
 
+    total_loss3 = total_loss + total_loss2
+    # Backprop
+    total_loss3.backward()
     # Optimizer step
     optimizer.step()
 
     # Return losses and data useful for computing statistics
-    return loss
+    return loss, loss2
 
   def _sample_rpn_minibatch(self, rpn_map, object_indices, background_indices):
     """
