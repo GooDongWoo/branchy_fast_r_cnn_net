@@ -108,9 +108,9 @@ There are three ways to run predictions on images:
 
 Examples of each:
 
+(default model is not ResNet. if you want to use ResNet model, you must not use this examples.
+instead use ResNet101 backbone example.)
 ```
-#default model is not ResNet. if you want to use ResNet model, you must not use this examples.
-#instead use below examples.
 python3 -m pytorch.FasterRCNN --load-from=saved_weights.pth --predict=http://trzy.org/files/fasterrcnn/gary.jpg
 python3 -m pytorch.FasterRCNN --load-from=saved_weights.pth --predict-to-file=image.png
 python3 -m pytorch.FasterRCNN --load-from=saved_weights.pth --predict-all=test
