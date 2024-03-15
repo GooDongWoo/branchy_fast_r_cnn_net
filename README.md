@@ -20,7 +20,6 @@ source pytorch_venv/bin/activate
 
 pip install Pillow==9.5.0
 pip install pip==20.0.2
-pip install pkg-resources==0.0.0
 pip install setuptools==44.0.0
 pip install sympy==1.12
 pip install torch
@@ -110,6 +109,8 @@ There are three ways to run predictions on images:
 Examples of each:
 
 ```
+#default model is not ResNet. if you want to use ResNet model, you must not use this examples.
+#instead use below examples.
 python3 -m pytorch.FasterRCNN --load-from=saved_weights.pth --predict=http://trzy.org/files/fasterrcnn/gary.jpg
 python3 -m pytorch.FasterRCNN --load-from=saved_weights.pth --predict-to-file=image.png
 python3 -m pytorch.FasterRCNN --load-from=saved_weights.pth --predict-all=test
