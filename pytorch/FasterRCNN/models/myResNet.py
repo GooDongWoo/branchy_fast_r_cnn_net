@@ -8,14 +8,21 @@ if __name__ == "__main__":
     sys.path.append(dir_path)
 import torch
 import torch.nn as nn
+import torchvision
 # from earlyexitnet.tools import get_output_shape
 
 
-def get_output_shape(module, img_dim):
+def get_output_shape(module_list, img_dim):
     # returns output shape
     device = 'cpu'
-    module = module.to(device)
-    dims = module(torch.rand(*(img_dim))).data.shape
+    tmp_=0
+    for module in module_list:
+        module = module.to(device)
+        if tmp_==0:
+            dims = module(torch.rand(*(img_dim))).data.shape
+        else:
+            dims = module(torch.rand(*(dims))).data.shape
+        tmp_+=1
     return dims
 
 class BasicBlock(nn.Module):
@@ -25,28 +32,29 @@ class BasicBlock(nn.Module):
         super().__init__()
 
         # BatchNorm에 bias가 포함되어 있으므로, conv2d는 bias=False로 설정합니다.
-        self.residual_function = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels * self.expansion),
-        )
+        self.conv1=nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1=nn.BatchNorm2d(out_channels)
+        self.relu=nn.ReLU()
+        self.conv2=nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2=nn.BatchNorm2d(out_channels * self.expansion)
+        
+        self.residual_function=[self.conv1,self.bn1,self.relu,self.conv2,self.bn2]
 
         # identity mapping, input과 output의 feature map size, filter 수가 동일한 경우 사용.
-        self.shortcut = nn.Sequential()
-
-        self.relu = nn.ReLU()
+        self.downsample = nn.Sequential()
 
         # projection mapping using 1x1conv
         if stride != 1 or in_channels != self.expansion * out_channels:
-            self.shortcut = nn.Sequential(
+            self.downsample = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(out_channels * self.expansion)
             )
 
     def forward(self, x):
-        x = self.residual_function(x) + self.shortcut(x)
+        y = self.downsample(x)
+        for i in self.residual_function:
+            x = i(x)
+        x += y
         x = self.relu(x)
         return x
 
@@ -57,23 +65,21 @@ class BottleNeck(BasicBlock):
     def __init__(self, in_channels, out_channels, stride=1):
         super(BottleNeck, self).__init__(in_channels, out_channels, stride)
 
-        self.residual_function = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=1, stride=1, bias=False),
-            nn.BatchNorm2d(out_channels * self.expansion),
-        )
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.conv3 = nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=1, stride=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
+        
+        self.residual_function = [self.conv1,self.bn1,self.relu,self.conv2,self.bn2,self.relu,self.conv3,self.bn3]
 
 
 #####################################################
 # TODO myResNet
 # ResNet8 backbone for training experiments - weights should be transferable
 class ResNet_backbone(nn.Module):
-    def __init__(self, block=BasicBlock, num_block=[], num_classes=21, init_weights=True):
+    def __init__(self, block=BasicBlock, num_block=[], num_classes=1000, init_weights=True):
         super(ResNet_backbone, self).__init__()
         self.exit_num = 1  # TODO -1 because of final exit
 
@@ -94,13 +100,8 @@ class ResNet_backbone(nn.Module):
         self.relu = nn.ReLU()
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        self.init_conv = nn.Sequential(
-            nn.Conv2d(3, self.in_chans, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(self.in_chans),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        )
-
+        self.init_conv = [self.conv1, self.bn1, self.relu, self.maxpool]
+        
         # backbone Layer
         # self.backbone = nn.ModuleList()
         self.layer1 = self._make_layer(self.block, self.in_chan_sizes[0], self.num_block[0], self.strides[0])
@@ -110,9 +111,10 @@ class ResNet_backbone(nn.Module):
 
         # self._build_backbone()
         # print(self.backbone)
-
-        self.end_layers = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
-                                        nn.Linear(512 * block.expansion, num_classes))
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+        self.end_layers = [self.avgpool, self.flatten, self.fc]
         # init weights+biases according to mlperf tiny
         if init_weights:
             self._weight_init()
@@ -169,8 +171,6 @@ class ResNet_backbone(nn.Module):
         y = self.maxpool(x)
         print('maxpool shape:', y.shape)
 
-        # y = self.init_conv(x)
-
         for b in self.layer1:
             y = b(y)
         for b in self.layer2:
@@ -179,7 +179,8 @@ class ResNet_backbone(nn.Module):
             y = b(y)
         for b in self.layer4:
             y = b(y)
-        y = self.end_layers(y)
+        for b in self.end_layers:
+            y = b(y)
         return [y]
 
 
@@ -248,7 +249,7 @@ class IntrClassif(nn.Module):
 
 class ResNet_2EE(ResNet_backbone):
     # basic early exit network for resnet8
-    def __init__(self, block=BasicBlock, num_block=[], num_classes=21, data_shape=[1, 3, 32, 32],
+    def __init__(self, block=BasicBlock, num_block=[], num_classes=1000, data_shape=[1, 3, 32, 32],
                  init_weights=True):
         '''
     data_shape: batch size must be 1. ex) [1,3,32,32]
@@ -400,3 +401,35 @@ def resnet152_2EE():
     return ResNet_2EE(BottleNeck, [3, 8, 36, 3])
 
 
+
+if __name__ == "__main__":
+    #tracking the myResNet's parameter
+    parameter_track_constatnt = 0
+    
+    script_dir = os.path.dirname(__file__) 
+    pth_rel_path = "pretrained_model"
+    file_name = "pretrained_resnet.pth"
+    abs_file_path = os.path.join(script_dir, pth_rel_path)
+    try:
+        if not os.path.exists(abs_file_path):
+            os.makedirs(abs_file_path)
+            
+    except OSError:
+        print ('Error: Creating directory. ' +  abs_file_path)
+    abs_file_path = os.path.join(abs_file_path, file_name)
+    resnet = torchvision.models.resnet101(weights = torchvision.models.ResNet101_Weights.IMAGENET1K_V1)
+    torch.save(resnet.state_dict(), abs_file_path)
+    model = resnet101().to('cuda')
+    model.load_state_dict(torch.load(abs_file_path))
+    
+    if parameter_track_constatnt:
+        log_rel_path = "parameter_log.txt"
+        abs_file_path = os.path.join(script_dir, log_rel_path)
+        # 파일 열기
+        f=open(abs_file_path,'w')
+        # 파일에 텍스트 쓰기
+        for param_tensor in model.state_dict():
+            f.write(f'{param_tensor} \t {model.state_dict()[param_tensor].size()}\n')    
+        # 파일 닫기
+        f.close()    
+    
