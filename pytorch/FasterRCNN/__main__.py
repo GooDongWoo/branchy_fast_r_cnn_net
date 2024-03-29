@@ -63,13 +63,14 @@ def render_anchors(backbone):
 def evaluate(model, eval_data = None, num_samples = None, plot = False, print_average_precisions = False):
   if eval_data is None:
     eval_data = voc.Dataset(
-      image_preprocessing_params = model.backbone.image_preprocessing_params,
-      compute_feature_map_shape_fn = model.backbone.compute_feature_map_shape,
-      feature_pixels = model.backbone.feature_pixels,
-      dir = options.dataset_dir,
-      split = options.eval_split,
-      augment = False,
-      shuffle = False
+      dir=options.dataset_dir,
+      split=options.eval_split,
+      image_preprocessing_params=model.backbone.image_preprocessing_params,
+      compute_feature_map_shape_fn=model.backbone.compute_feature_map_shape,
+      feature_pixels=model.backbone.feature_pixels,
+      augment=False,
+      shuffle=False,
+      cache=False
     )
   if num_samples is None:
     num_samples = eval_data.num_samples
@@ -95,6 +96,44 @@ def evaluate(model, eval_data = None, num_samples = None, plot = False, print_av
   if plot:
     precision_recall_curve.plot_average_precisions(class_index_to_name = voc.Dataset.class_index_to_name)
   return mean_average_precision
+
+def evaluate_ee(model, eval_data = None, num_samples = None, plot = False, print_average_precisions = False):
+  if eval_data is None:
+    eval_data = voc.Dataset(
+      dir=options.dataset_dir,
+      split=options.eval_split,
+      image_preprocessing_params=model.backbone.image_preprocessing_params,
+      compute_feature_map_shape_fn=model.backbone.compute_feature_map_shape,
+      feature_pixels=model.backbone.feature_pixels,
+      augment=False,
+      shuffle=False,
+      cache=False
+    )
+  if num_samples is None:
+    num_samples = eval_data.num_samples
+  precision_recall_curve = PrecisionRecallCurveCalculator()
+  i = 0
+  print("Evaluating '%s'..." % eval_data.split)
+  for sample in tqdm(iterable = iter(eval_data), total = num_samples):
+    scored_boxes_by_class_index = model.predict_ee(
+      image_data = t.from_numpy(sample.image_data).unsqueeze(dim = 0).cuda(),
+      score_threshold = 0.05  # lower threshold for evaluation
+    )
+    precision_recall_curve.add_image_results(
+      scored_boxes_by_class_index = scored_boxes_by_class_index,
+      gt_boxes = sample.gt_boxes
+    )
+    i += 1
+    if i >= num_samples:
+      break
+  if print_average_precisions:
+    precision_recall_curve.print_average_precisions(class_index_to_name = voc.Dataset.class_index_to_name)
+  mean_average_precision = 100.0 * precision_recall_curve.compute_mean_average_precision()
+  print("Mean Average Precision = %1.2f%%" % mean_average_precision)
+  if plot:
+    precision_recall_curve.plot_average_precisions(class_index_to_name = voc.Dataset.class_index_to_name)
+  return mean_average_precision
+
 
 def create_optimizer(model):
   params = []
@@ -173,7 +212,8 @@ def train(model):
     stats = TrainingStatistics()
     progbar = tqdm(iterable = iter(training_data), total = training_data.num_samples, postfix = stats.get_progbar_postfix())
     for sample in progbar:
-      loss = model.train_step(  # don't retain any tensors we don't need (helps memory usage)
+      if epoch % 2 == 0:
+        loss = model.train_step(  # don't retain any tensors we don't need (helps memory usage)
         optimizer = optimizer,
         image_data = t.from_numpy(sample.image_data).unsqueeze(dim = 0).cuda(),
         anchor_map = sample.anchor_map,
@@ -182,7 +222,18 @@ def train(model):
         gt_rpn_object_indices = [ sample.gt_rpn_object_indices ],
         gt_rpn_background_indices = [ sample.gt_rpn_background_indices ],
         gt_boxes = [ sample.gt_boxes ]
-      )
+        )
+      else:
+        loss = model.train_step_ee(  # don't retain any tensors we don't need (helps memory usage)
+          optimizer=optimizer,
+          image_data=t.from_numpy(sample.image_data).unsqueeze(dim=0).cuda(),
+          anchor_map=sample.anchor_map,
+          anchor_valid_map=sample.anchor_valid_map,
+          gt_rpn_map=t.from_numpy(sample.gt_rpn_map).unsqueeze(dim=0).cuda(),
+          gt_rpn_object_indices=[sample.gt_rpn_object_indices],
+          gt_rpn_background_indices=[sample.gt_rpn_background_indices],
+          gt_boxes=[sample.gt_boxes]
+        )
       stats.on_training_step(loss = loss)
       progbar.set_postfix(stats.get_progbar_postfix())
     last_epoch = epoch == options.epochs
@@ -235,6 +286,17 @@ def predict(model, image_data, image, show_image, output_path):
     class_index_to_name = voc.Dataset.class_index_to_name
   )
 
+def predict_ee(model, image_data, image, show_image, output_path):
+  image_data = t.from_numpy(image_data).unsqueeze(dim = 0).cuda()
+  scored_boxes_by_class_index = model.predict_ee(image_data = image_data, score_threshold = 0.7)
+  visualize.show_detections(
+    output_path = output_path,
+    show_image = show_image,
+    image = image,
+    scored_boxes_by_class_index = scored_boxes_by_class_index,
+    class_index_to_name = voc.Dataset.class_index_to_name
+  )
+
 def predict_one(model, url, show_image, output_path):
   from .datasets import image
   image_data, image_obj, _, _ = image.load_image(url = url, preprocessing = model.backbone.image_preprocessing_params, min_dimension_pixels = 600)
@@ -257,15 +319,34 @@ def predict_all(model, split):
   for sample in iter(dataset):
     output_path = os.path.join(dirname, os.path.splitext(os.path.basename(sample.filepath))[0] + ".png")
     predict(model = model, image_data = sample.image_data, image = sample.image, show_image = False, output_path = output_path)
+def predict_all_ee(model, split):
+  dirname = "predictions_ee" + split
+  if not os.path.exists(dirname):
+    os.makedirs(dirname)
+  print("Rendering predictions from '%s' set to '%s'..." % (split, dirname))
+  dataset = voc.Dataset(
+    dir = options.dataset_dir,
+    split = split,
+    image_preprocessing_params = model.backbone.image_preprocessing_params,
+    compute_feature_map_shape_fn = model.backbone.compute_feature_map_shape,
+    feature_pixels = model.backbone.feature_pixels,
+    augment = False,
+    shuffle = False
+  )
+  for sample in iter(dataset):
+    output_path = os.path.join(dirname, os.path.splitext(os.path.basename(sample.filepath))[0] + ".png")
+    predict_ee(model = model, image_data = sample.image_data, image = sample.image, show_image = False, output_path = output_path)
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser("FasterRCNN")
   group = parser.add_mutually_exclusive_group()
   group.add_argument("--train", action = "store_true", help = "Train model")
   group.add_argument("--eval", action = "store_true", help = "Evaluate model")
+  group.add_argument("--eval_ee", action="store_true", help="Evaluate model")
   group.add_argument("--predict", metavar = "url", action = "store", type = str, help = "Run inference on image and display detected boxes")
   group.add_argument("--predict-to-file", metavar = "url", action = "store", type = str, help = "Run inference on image and render detected boxes to 'predictions.png'")
   group.add_argument("--predict-all", metavar = "name", action = "store", type = str, help = "Run inference on all images in the specified dataset split and write to directory 'predictions_${split}'")
+  group.add_argument("--predict-all_ee", metavar="name", action="store", type=str, help="Run inference on all images in the specified dataset split and write to directory 'predictions_${split}'")
   parser.add_argument("--load-from", metavar = "file", action = "store", help = "Load initial model weights from file")
   parser.add_argument("--backbone", metavar = "model", action = "store", default = "vgg16", help = "Backbone model for feature extraction and classification")
   parser.add_argument("--save-to", metavar = "file", action = "store", help = "Save final trained weights to file")
@@ -305,7 +386,7 @@ if __name__ == "__main__":
   elif options.backbone == "resnet152":
     backbone = resnet.ResNetBackbone(architecture = resnet.Architecture.ResNet152)
   elif options.backbone == "resnet101_ee":
-    backbone = resnet101_ee.ResNetBackbone(architecture=resnet101_ee.Architecture.ResNet101)
+    backbone = resnet101_ee.ResNetBackbone(architecture="ResNet101")
 
   # Perform optional procedures
   if options.dump_anchors:
@@ -324,12 +405,48 @@ if __name__ == "__main__":
   if options.train:
     train(model = model)
   elif options.eval:
-    evaluate(model = model, plot = options.plot, print_average_precisions = True)
+    eval_data = voc.Dataset(
+      dir=options.dataset_dir,
+      split=options.eval_split,
+      image_preprocessing_params=model.backbone.image_preprocessing_params,
+      compute_feature_map_shape_fn=model.backbone.compute_feature_map_shape,
+      feature_pixels=model.backbone.feature_pixels,
+      augment=False,
+      shuffle=False,
+      cache=False
+    )
+    evaluate(
+      model=model,
+      eval_data=eval_data,
+      num_samples=eval_data.num_samples,  # use all samples
+      plot=options.plot,
+      print_average_precisions=True
+    )
+  elif options.eval_ee:
+    eval_data = voc.Dataset(
+      dir=options.dataset_dir,
+      split=options.eval_split,
+      image_preprocessing_params=model.backbone.image_preprocessing_params,
+      compute_feature_map_shape_fn=model.backbone.compute_feature_map_shape,
+      feature_pixels=model.backbone.feature_pixels,
+      augment=False,
+      shuffle=False,
+      cache=False
+    )
+    evaluate_ee(
+      model=model,
+      eval_data=eval_data,
+      num_samples=eval_data.num_samples,  # use all samples
+      plot=options.plot,
+      print_average_precisions=True
+    )
   elif options.predict:
-    predict_one(model = model, url = options.predict, show_image = True, output_path = "aaaa.png")
+    predict_one(model = model, url = options.predict, show_image = True, output_path = None)
   elif options.predict_to_file:
     predict_one(model = model, url = options.predict_to_file, show_image = False, output_path = "predictions.png")
   elif options.predict_all:
     predict_all(model = model, split = options.predict_all)
+  elif options.predict_all_ee:
+    predict_all_ee(model = model, split = options.predict_all_ee)
   elif not options.dump_anchors:
     print("Nothing to do. Did you mean to use --train or --predict?")
