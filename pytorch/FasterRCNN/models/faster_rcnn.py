@@ -77,15 +77,6 @@ class FasterRCNNModel(nn.Module):
       backbone = backbone
     )
 
-    self._stage2_region_proposal_network2 = rpn.RegionProposalNetwork(
-      feature_map_channels=backbone.feature_map_channels,
-      allow_edge_proposals=allow_edge_proposals
-    )
-    self._stage3_detector_network2 = detector.DetectorNetwork(
-      num_classes=num_classes,
-      backbone=backbone
-    )
-
   def forward(self, image_data, anchor_map = None, anchor_valid_map = None):
     """
     Forward inference. Use for test and evaluation only.
@@ -124,11 +115,9 @@ class FasterRCNNModel(nn.Module):
       anchor_map, anchor_valid_map = anchors.generate_anchor_maps(image_shape = image_shape, feature_map_shape = feature_map_shape, feature_pixels = self.backbone.feature_pixels)
 
     # Run each stage
-    feature_map1, feature_map2 = self._stage1_feature_extractor(image_data = image_data)
-
-
+    feature_map_a, feature_map = self._stage1_feature_extractor(image_data = image_data)
     objectness_score_map, box_deltas_map, proposals = self._stage2_region_proposal_network(
-      feature_map = feature_map1,
+      feature_map = feature_map,
       image_shape = image_shape,
       anchor_map = anchor_map,
       anchor_valid_map = anchor_valid_map,
@@ -136,24 +125,65 @@ class FasterRCNNModel(nn.Module):
       max_proposals_post_nms = 300
     )
     classes, box_deltas = self._stage3_detector_network(
-      feature_map = feature_map1,
+      feature_map = feature_map,
       proposals = proposals
     )
 
-    objectness_score_map2, box_deltas_map2, proposals2 = self._stage2_region_proposal_network2(
-      feature_map=feature_map2,
-      image_shape=image_shape,
-      anchor_map=anchor_map,
-      anchor_valid_map=anchor_valid_map,
-      max_proposals_pre_nms=6000,  # test time values
-      max_proposals_post_nms=300
+    return proposals, classes, box_deltas
+
+  def earlyexit(self, image_data, anchor_map = None, anchor_valid_map = None):
+    """
+    Forward inference. Use for test and evaluation only.
+
+    Parameters
+    ----------
+    image_data : torch.Tensor
+      A tensor of shape (batch_size, channels, height, width) representing
+      images normalized using the VGG-16 convention (BGR, ImageNet channel-wise
+      mean-centered).
+    anchor_map : torch.Tensor
+      Map of anchors, shaped (height, width, num_anchors * 4). The last
+      dimension contains the anchor boxes specified as a 4-tuple of
+      (center_y, center_x, height, width), repeated for all anchors at that
+      coordinate of the feature map. If this or anchor_valid_map is not
+      provided, both will be computed here.
+    anchor_valid_map : torch.Tensor
+      Map indicating which anchors are valid (do not intersect image bounds),
+      shaped (height, width). If this or anchor_map is not provided, both will
+      be computed here.
+
+    Returns
+    -------
+    np.ndarray, torch.Tensor, torch.Tensor
+      - Proposals (N, 4) from region proposal network
+      - Classes (M, num_classes) from detector network
+      - Box delta regressions (M, (num_classes - 1) * 4) from detector network
+    """
+    assert image_data.shape[0] == 1, "Batch size must be 1"
+    image_shape = image_data.shape[1:]  # (batch_index, channels, height, width) -> (channels, height, width)
+
+    # Anchor maps can be pre-computed and passed in explicitly (for performance
+    # reasons) but if they are missing, we compute them on-the-fly here
+    if anchor_map is None or anchor_valid_map is None:
+      feature_map_shape = self.backbone.compute_feature_map_shape(image_shape = image_shape)
+      anchor_map, anchor_valid_map = anchors.generate_anchor_maps(image_shape = image_shape, feature_map_shape = feature_map_shape, feature_pixels = self.backbone.feature_pixels)
+
+    # Run each stage
+    feature_map_a, feature_map = self._stage1_feature_extractor(image_data = image_data)
+    objectness_score_map, box_deltas_map, proposals = self._stage2_region_proposal_network(
+      feature_map = feature_map_a,
+      image_shape = image_shape,
+      anchor_map = anchor_map,
+      anchor_valid_map = anchor_valid_map,
+      max_proposals_pre_nms = 6000, # test time values
+      max_proposals_post_nms = 300
     )
-    classes2, box_deltas2 = self._stage3_detector_network2(
-      feature_map=feature_map2,
-      proposals=proposals2
+    classes, box_deltas = self._stage3_detector_network(
+      feature_map = feature_map,
+      proposals = proposals
     )
 
-    return proposals, classes, box_deltas, proposals2, classes2, box_deltas2
+    return proposals, classes, box_deltas
 
   @utils.no_grad
   def predict(self, image_data, score_threshold, anchor_map = None, anchor_valid_map = None):
@@ -191,39 +221,108 @@ class FasterRCNNModel(nn.Module):
     assert image_data.shape[0] == 1, "Batch size must be 1"
 
     # Forward inference
+    proposals, classes, box_deltas = self(
+      image_data = image_data,
+      anchor_map = anchor_map,
+      anchor_valid_map = anchor_valid_map
+    )
+    proposals = proposals.cpu().numpy()
+    classes = classes.cpu().numpy()
+    box_deltas = box_deltas.cpu().numpy()
 
-    proposals, classes, box_deltas, proposals2, classes2, box_deltas2 = self(
+    # Convert proposal boxes -> center point and size
+    proposal_anchors = np.empty(proposals.shape)
+    proposal_anchors[:,0] = 0.5 * (proposals[:,0] + proposals[:,2]) # center_y
+    proposal_anchors[:,1] = 0.5 * (proposals[:,1] + proposals[:,3]) # center_x
+    proposal_anchors[:,2:4] = proposals[:,2:4] - proposals[:,0:2]   # height, width
+
+    # Separate out results per class: class_idx -> (y1, x1, y2, x2, score)
+    boxes_and_scores_by_class_idx = {}
+    for class_idx in range(1, classes.shape[1]):  # skip class 0 (background)
+      # Get the box deltas (ty, tx, th, tw) corresponding to this class, for
+      # all proposals
+      box_delta_idx = (class_idx - 1) * 4
+      box_delta_params = box_deltas[:, (box_delta_idx + 0) : (box_delta_idx + 4)] # (N, 4)
+      proposal_boxes_this_class = math_utils.convert_deltas_to_boxes(
+        box_deltas = box_delta_params,
+        anchors = proposal_anchors,
+        box_delta_means = self._detector_box_delta_means,
+        box_delta_stds = self._detector_box_delta_stds
+      )
+
+      # Clip to image boundaries
+      proposal_boxes_this_class[:,0::2] = np.clip(proposal_boxes_this_class[:,0::2], 0, image_data.shape[2] - 1)  # clip y1 and y2 to [0,height)
+      proposal_boxes_this_class[:,1::2] = np.clip(proposal_boxes_this_class[:,1::2], 0, image_data.shape[3] - 1)  # clip x1 and x2 to [0,width)
+
+      # Get the scores for this class. The class scores are returned in
+      # normalized categorical form. Each row corresponds to a class.
+      scores_this_class = classes[:,class_idx]
+
+      # Keep only those scoring high enough
+      sufficiently_scoring_idxs = np.where(scores_this_class > score_threshold)[0]
+      proposal_boxes_this_class = proposal_boxes_this_class[sufficiently_scoring_idxs]
+      scores_this_class = scores_this_class[sufficiently_scoring_idxs]
+      boxes_and_scores_by_class_idx[class_idx] = (proposal_boxes_this_class, scores_this_class)
+
+    # Perform NMS per class
+    scored_boxes_by_class_idx = {}
+    for class_idx, (boxes, scores) in boxes_and_scores_by_class_idx.items():
+      idxs = nms(
+        boxes = t.from_numpy(boxes).cuda(),
+        scores = t.from_numpy(scores).cuda(),
+        iou_threshold = 0.3 #TODO: unsure about this. Paper seems to imply 0.5 but https://github.com/rbgirshick/py-faster-rcnn/blob/master/lib/fast_rcnn/config.py has 0.3 for test NMS
+      ).cpu().numpy()
+      boxes = boxes[idxs]
+      scores = np.expand_dims(scores[idxs], axis = 0) # (N,) -> (N,1)
+      scored_boxes = np.hstack([ boxes, scores.T ])   # (N,5), with each row: (y1, x1, y2, x2, score)
+      scored_boxes_by_class_idx[class_idx] = scored_boxes
+
+    return scored_boxes_by_class_idx
+
+  def predict_ee(self, image_data, score_threshold, anchor_map = None, anchor_valid_map = None):
+    """
+    Performs inference on an image and obtains the final detected boxes.
+
+    Parameters
+    ----------
+    image_data : torch.Tensor
+      A tensor of shape (batch_size, channels, height, width) representing
+      images normalized using the VGG-16 convention (BGR, ImageNet channel-wise
+      mean-centered).
+    score_threshold : float
+      Minimum required score threshold (applied per class) for a detection to
+      be considered. Set this higher for visualization to minimize extraneous
+      boxes.
+    anchor_map : torch.Tensor
+      Map of anchors, shaped (height, width, num_anchors * 4). The last
+      dimension contains the anchor boxes specified as a 4-tuple of
+      (center_y, center_x, height, width), repeated for all anchors at that
+      coordinate of the feature map. If this or anchor_valid_map is not
+      provided, both will be computed here.
+    anchor_valid_map : torch.Tensor
+      Map indicating which anchors are valid (do not intersect image bounds),
+      shaped (height, width). If this or anchor_map is not provided, both will
+      be computed here.
+
+    Returns
+    -------
+    Dict[int, np.ndarray]
+      Scored boxes, (N, 5) tensor of box corners and class score,
+      (y1, x1, y2, x2, score), indexed by class index.
+    """
+    self.eval()
+    assert image_data.shape[0] == 1, "Batch size must be 1"
+
+    # Forward inference
+    proposals, classes, box_deltas = self.earlyexit(
       image_data = image_data,
       anchor_map = anchor_map,
       anchor_valid_map = anchor_valid_map
     )
 
-    exit_threshold = t.tensor([0.8],
-                              dtype=t.float32).to('cuda')
-    top = 0
-    with t.no_grad():
-      for i1 in classes :
-        pk = nn.functional.softmax(i1, dim=-1)
-        # print("pk : ", pk)
-        top1 = t.max(pk)
-        # print("top1 : ", top1)
-        # top1 = t.log(top1) * top1
-        # print("top1 : ", top1)
-        top += top1
-    print(top / len(classes))
-    if (top / len(classes) < exit_threshold).cpu().detach().numpy():
-      proposals = proposals2
-      classes= classes2
-      box_deltas = box_deltas2
-      print("convert 2")
-
-    # print("A : ", proposals)
-    # print("B : ", proposals2)
-
-
     proposals = proposals.cpu().numpy()
-    classes = classes.cpu().numpy()
-    box_deltas = box_deltas.cpu().numpy()
+    classes = classes.cpu().detach().numpy()
+    box_deltas = box_deltas.cpu().detach().numpy()
 
     # Convert proposal boxes -> center point and size
     proposal_anchors = np.empty(proposals.shape)
@@ -340,11 +439,13 @@ class FasterRCNNModel(nn.Module):
     image_shape = image_data.shape[1:]
 
     # Stage 1: Extract features
-    feature_map1, feature_map2 = self._stage1_feature_extractor(image_data = image_data)
+    feature_map_a, feature_map = self._stage1_feature_extractor(image_data = image_data)
+    # print("AA", feature_map_a.shape)
+    # print(feature_map.shape)
 
     # Stage 2: Generate object proposals using RPN
     rpn_score_map, rpn_box_deltas_map, proposals = self._stage2_region_proposal_network(
-      feature_map = feature_map1,
+      feature_map = feature_map,
       image_shape = image_shape,  # each image in batch has identical shape: (num_channels, height, width)
       anchor_map = anchor_map,
       anchor_valid_map = anchor_valid_map,
@@ -381,59 +482,13 @@ class FasterRCNNModel(nn.Module):
     gt_classes = gt_classes.detach()
     gt_box_deltas = gt_box_deltas.detach()
 
-
-
-
-
-    rpn_score_map2, rpn_box_deltas_map2, proposals2 = self._stage2_region_proposal_network2(
-      feature_map=feature_map2,
-      image_shape=image_shape,  # each image in batch has identical shape: (num_channels, height, width)
-      anchor_map=anchor_map,
-      anchor_valid_map=anchor_valid_map,
-      max_proposals_pre_nms=12000,
-      max_proposals_post_nms=2000
-    )
-
-    # Sample random mini-batch of anchors (for RPN training)
-
-    # Assign labels to proposals and take random sample (for detector training)
-    proposals2, gt_classes2, gt_box_deltas2 = self._label_proposals(
-      proposals=proposals2,
-      gt_boxes=gt_boxes[0],  # for now, batch size of 1
-      min_background_iou_threshold=0.0,
-      min_object_iou_threshold=0.5
-    )
-    proposals2, gt_classes2, gt_box_deltas2 = self._sample_proposals(
-      proposals=proposals2,
-      gt_classes=gt_classes2,
-      gt_box_deltas=gt_box_deltas2,
-      max_proposals=self._proposal_batch_size,
-      positive_fraction=0.25
-    )
-
-    # Make sure RoI proposals and ground truths are detached from computational
-    # graph so that gradients are not propagated through them. They are treated
-    # as constant inputs into the detector stage.
-    proposals2 = proposals2.detach()
-    gt_classes2 = gt_classes2.detach()
-    gt_box_deltas2 = gt_box_deltas2.detach()
-
-
-
-
-
-
     # Stage 3: Detector
     detector_classes, detector_box_deltas = self._stage3_detector_network(
-      feature_map = feature_map1,
+      feature_map = feature_map,
       proposals = proposals
     )
 
-    detector_classes2, detector_box_deltas2 = self._stage3_detector_network2(
-      feature_map=feature_map2,
-      proposals=proposals2
-    )
-    # Compute losses1
+    # Compute losses
     rpn_class_loss = rpn.class_loss(predicted_scores = rpn_score_map, y_true = gt_rpn_minibatch_map)
     rpn_regression_loss = rpn.regression_loss(predicted_box_deltas = rpn_box_deltas_map, y_true = gt_rpn_minibatch_map)
     detector_class_loss = detector.class_loss(predicted_classes = detector_classes, y_true = gt_classes)
@@ -447,29 +502,161 @@ class FasterRCNNModel(nn.Module):
       total = total_loss.detach().cpu().item()
     )
 
-    #2
-    rpn_class_loss2 = rpn.class_loss(predicted_scores=rpn_score_map2, y_true=gt_rpn_minibatch_map)
-    rpn_regression_loss2 = rpn.regression_loss(predicted_box_deltas=rpn_box_deltas_map2, y_true=gt_rpn_minibatch_map)
-    detector_class_loss2 = detector.class_loss(predicted_classes=detector_classes2, y_true=gt_classes2)
-    detector_regression_loss2 = detector.regression_loss(predicted_box_deltas=detector_box_deltas2, y_true=gt_box_deltas2)
-    total_loss2 = rpn_class_loss2 + rpn_regression_loss2 + detector_class_loss2 + detector_regression_loss2
-    loss2 = FasterRCNNModel.Loss(
-      rpn_class=rpn_class_loss2.detach().cpu().item(),
-      rpn_regression=rpn_regression_loss2.detach().cpu().item(),
-      detector_class=detector_class_loss2.detach().cpu().item(),
-      detector_regression=detector_regression_loss2.detach().cpu().item(),
-      total=total_loss2.detach().cpu().item()
-    )
-
-    total_loss3 = total_loss + total_loss2
     # Backprop
-    total_loss3.backward()
+    total_loss.backward()
+
     # Optimizer step
     optimizer.step()
 
     # Return losses and data useful for computing statistics
-    return loss, loss2
+    return loss
 
+  def train_step_ee(self, optimizer, image_data, anchor_map, anchor_valid_map, gt_rpn_map, gt_rpn_object_indices, gt_rpn_background_indices, gt_boxes):
+    """
+    Performs one training step on a sample of data.
+
+    Parameters
+    ----------
+    optimizer : torch.optim.Optimizer
+      Optimizer.
+    image_data : torch.Tensor
+      A tensor of shape (batch_size, channels, height, width) representing
+      images normalized using the VGG-16 convention (BGR, ImageNet channel-wise
+      mean-centered).
+    anchor_map : torch.Tensor
+      Map of anchors, shaped (height, width, num_anchors * 4). The last
+      dimension contains the anchor boxes specified as a 4-tuple of
+      (center_y, center_x, height, width), repeated for all anchors at that
+      coordinate of the feature map. If this or anchor_valid_map is not
+      provided, both will be computed here.
+    anchor_valid_map : torch.Tensor
+      Map indicating which anchors are valid (do not intersect image bounds),
+      shaped (height, width). If this or anchor_map is not provided, both will
+      be computed here.
+    gt_rpn_map : torch.Tensor
+      Ground truth RPN map of shape
+      (batch_size, height, width, num_anchors, 6), where height and width are
+      the feature map dimensions, not the input image dimensions. The final
+      dimension contains:
+       - 0: Trainable anchor (1) or not (0). Only valid and non-neutral (that
+            is, definitely positive or negative) anchors are trainable. This is
+            the same as anchor_valid_map with additional invalid anchors caused
+            by neutral samples
+       - 1: For trainable anchors, whether the anchor is an object anchor (1)
+            or background anchor (0). For non-trainable anchors, will be 0.
+       - 2: Regression target for box center, ty.
+       - 3: Regression target for box center, tx.
+       - 4: Regression target for box size, th.
+       - 5: Regression target for box size, tw.
+    gt_rpn_object_indices : List[np.ndarray]
+      For each image in the batch, a map of shape (N, 3) of indices (y, x, k)
+      of all N object anchors in the RPN ground truth map.
+    gt_rpn_background_indices : List[np.ndarray]
+      For each image in the batch, a map of shape (M, 3) of indices of all M
+      background anchors in the RPN ground truth map.
+    gt_boxes : List[List[datasets.training_sample.Box]]
+      For each image in the batch, a list of ground truth object boxes.
+
+    Returns
+    -------
+    Loss
+      Loss (a dataclass with class and regression losses for both the RPN and
+      detector states).
+    """
+    self.train()
+
+    # Clear accumulated gradient
+    optimizer.zero_grad()
+
+    # For now, we only support a batch size of 1
+    assert image_data.shape[0] == 1, "Batch size must be 1"
+    assert len(gt_rpn_map.shape) == 5 and gt_rpn_map.shape[0] == 1, "Batch size must be 1"
+    assert len(gt_rpn_object_indices) == 1, "Batch size must be 1"
+    assert len(gt_rpn_background_indices) == 1, "Batch size must be 1"
+    assert len(gt_boxes) == 1, "Batch size must be 1"
+    image_shape = image_data.shape[1:]
+
+    # Stage 1: Extract features
+    feature_map, feature_map_a = self._stage1_feature_extractor(image_data = image_data)
+    # print("AA", feature_map_a.shape)
+    # print(feature_map.shape)
+
+    # Stage 2: Generate object proposals using RPN
+    rpn_score_map, rpn_box_deltas_map, proposals = self._stage2_region_proposal_network(
+      feature_map = feature_map,
+      image_shape = image_shape,  # each image in batch has identical shape: (num_channels, height, width)
+      anchor_map = anchor_map,
+      anchor_valid_map = anchor_valid_map,
+      max_proposals_pre_nms = 12000,
+      max_proposals_post_nms = 2000
+    )
+
+    rpn_score_map, rpn_box_deltas_map, proposals = self._stage2_region_proposal_network(
+      feature_map=feature_map_a,
+      image_shape=image_shape,  # each image in batch has identical shape: (num_channels, height, width)
+      anchor_map=anchor_map,
+      anchor_valid_map=anchor_valid_map,
+      max_proposals_pre_nms=12000,
+      max_proposals_post_nms=2000
+    )
+
+    # Sample random mini-batch of anchors (for RPN training)
+    gt_rpn_minibatch_map = self._sample_rpn_minibatch(
+      rpn_map = gt_rpn_map,
+      object_indices = gt_rpn_object_indices,
+      background_indices = gt_rpn_background_indices
+    )
+
+    # Assign labels to proposals and take random sample (for detector training)
+    proposals, gt_classes, gt_box_deltas = self._label_proposals(
+      proposals = proposals,
+      gt_boxes = gt_boxes[0], # for now, batch size of 1
+      min_background_iou_threshold = 0.0,
+      min_object_iou_threshold = 0.5
+    )
+    proposals, gt_classes, gt_box_deltas = self._sample_proposals(
+      proposals = proposals,
+      gt_classes = gt_classes,
+      gt_box_deltas = gt_box_deltas,
+      max_proposals = self._proposal_batch_size,
+      positive_fraction = 0.25
+    )
+
+    # Make sure RoI proposals and ground truths are detached from computational
+    # graph so that gradients are not propagated through them. They are treated
+    # as constant inputs into the detector stage.
+    proposals = proposals.detach()
+    gt_classes = gt_classes.detach()
+    gt_box_deltas = gt_box_deltas.detach()
+
+    # Stage 3: Detector
+    detector_classes, detector_box_deltas = self._stage3_detector_network(
+      feature_map = feature_map,
+      proposals = proposals
+    )
+
+    # Compute losses
+    rpn_class_loss = rpn.class_loss(predicted_scores = rpn_score_map, y_true = gt_rpn_minibatch_map)
+    rpn_regression_loss = rpn.regression_loss(predicted_box_deltas = rpn_box_deltas_map, y_true = gt_rpn_minibatch_map)
+    detector_class_loss = detector.class_loss(predicted_classes = detector_classes, y_true = gt_classes)
+    detector_regression_loss = detector.regression_loss(predicted_box_deltas = detector_box_deltas, y_true = gt_box_deltas)
+    total_loss = rpn_class_loss + rpn_regression_loss + detector_class_loss + detector_regression_loss
+    loss = FasterRCNNModel.Loss(
+      rpn_class = rpn_class_loss.detach().cpu().item(),
+      rpn_regression = rpn_regression_loss.detach().cpu().item(),
+      detector_class = detector_class_loss.detach().cpu().item(),
+      detector_regression = detector_regression_loss.detach().cpu().item(),
+      total = total_loss.detach().cpu().item()
+    )
+
+    # Backprop
+    total_loss.backward()
+
+    # Optimizer step
+    optimizer.step()
+
+    # Return losses and data useful for computing statistics
+    return loss
   def _sample_rpn_minibatch(self, rpn_map, object_indices, background_indices):
     """
     Selects anchors for training and produces a copy of the RPN ground truth

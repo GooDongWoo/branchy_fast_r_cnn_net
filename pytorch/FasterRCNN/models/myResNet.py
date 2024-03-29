@@ -25,6 +25,7 @@ def get_output_shape(module_list, img_dim):
         tmp_+=1
     return dims
 
+
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -32,13 +33,14 @@ class BasicBlock(nn.Module):
         super().__init__()
 
         # BatchNorm에 bias가 포함되어 있으므로, conv2d는 bias=False로 설정합니다.
-        self.conv1=nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1=nn.BatchNorm2d(out_channels)
-        self.relu=nn.ReLU()
-        self.conv2=nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2=nn.BatchNorm2d(out_channels * self.expansion)
-        
-        self.residual_function=[self.conv1,self.bn1,self.relu,self.conv2,self.bn2]
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=3, stride=1, padding=1,
+                               bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels * self.expansion)
+
+        self.residual_function = [self.conv1, self.bn1, self.relu, self.conv2, self.bn2]
 
         # identity mapping, input과 output의 feature map size, filter 수가 동일한 경우 사용.
         self.downsample = nn.Sequential()
@@ -71,8 +73,9 @@ class BottleNeck(BasicBlock):
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.conv3 = nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=1, stride=1, bias=False)
         self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
-        
-        self.residual_function = [self.conv1,self.bn1,self.relu,self.conv2,self.bn2,self.relu,self.conv3,self.bn3]
+
+        self.residual_function = [self.conv1, self.bn1, self.relu, self.conv2, self.bn2, self.relu, self.conv3,
+                                  self.bn3]
 
 
 #####################################################
@@ -101,7 +104,7 @@ class ResNet_backbone(nn.Module):
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         self.init_conv = [self.conv1, self.bn1, self.relu, self.maxpool]
-        
+
         # backbone Layer
         # self.backbone = nn.ModuleList()
         self.layer1 = self._make_layer(self.block, self.in_chan_sizes[0], self.num_block[0], self.strides[0])
@@ -115,6 +118,7 @@ class ResNet_backbone(nn.Module):
         self.flatten = nn.Flatten()
         self.fc = nn.Linear(512 * block.expansion, num_classes)
         self.end_layers = [self.avgpool, self.flatten, self.fc]
+
         # init weights+biases according to mlperf tiny
         if init_weights:
             self._weight_init()
@@ -171,6 +175,8 @@ class ResNet_backbone(nn.Module):
         y = self.maxpool(x)
         print('maxpool shape:', y.shape)
 
+        # y = self.init_conv(x)
+
         for b in self.layer1:
             y = b(y)
         for b in self.layer2:
@@ -199,52 +205,52 @@ class ConvBasic(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
-
-class IntrClassif(nn.Module):
-    # intermediate classifer head to be attached along the backbone
-    # Inpsired by MSDNet classifiers (from HAPI):
-    # https://github.com/kalviny/MSDNet-PyTorch/blob/master/models/msdnet.py
-
-    def __init__(self, chanIn, input_shape, classes, bb_index, interChans=64, last_conv_chan=32):
-        super(IntrClassif, self).__init__()
-
-        # index for the position in the backbone layer
-        self.bb_index = bb_index
-        # input shape to automatically size linear layer
-        self.input_shape = input_shape
-
-        # intermediate conv channels
-        # interChans = 128 # TODO reduce size for smaller nets
-        self.interChans = interChans
-        self.last_conv_chan = last_conv_chan
-        # conv, bnorm, relu 1
-        layers = nn.ModuleList()
-        self.conv1 = ConvBasic(chanIn, interChans, k=5, s=1, p=2)
-        layers.append(self.conv1)
-        self.conv2 = ConvBasic(interChans, interChans, k=3, s=1, p=1)
-        layers.append(self.conv2)
-        self.conv3 = ConvBasic(interChans, last_conv_chan, k=3, s=1, p=1)
-        layers.append(self.conv3)
-        self.layers = layers
-
-        self.linear_dim = int(torch.prod(torch.tensor(self._get_linear_size(layers))))
-        # print(f"Classif @ {self.bb_index} linear dim: {self.linear_dim}") #check linear dim
-
-        # linear layer
-        self.linear = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(self.linear_dim, classes)
-        )
-
-    def _get_linear_size(self, layers):
-        for layer in layers:
-            self.input_shape = get_output_shape(layer, self.input_shape)
-        return self.input_shape
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return self.linear(x)
+#
+# class IntrClassif(nn.Module):
+#     # intermediate classifer head to be attached along the backbone
+#     # Inpsired by MSDNet classifiers (from HAPI):
+#     # https://github.com/kalviny/MSDNet-PyTorch/blob/master/models/msdnet.py
+#
+#     def __init__(self, chanIn, input_shape, classes, bb_index, interChans=64, last_conv_chan=32):
+#         super(IntrClassif, self).__init__()
+#
+#         # index for the position in the backbone layer
+#         self.bb_index = bb_index
+#         # input shape to automatically size linear layer
+#         self.input_shape = input_shape
+#
+#         # intermediate conv channels
+#         # interChans = 128 # TODO reduce size for smaller nets
+#         self.interChans = interChans
+#         self.last_conv_chan = last_conv_chan
+#         # conv, bnorm, relu 1
+#         layers = nn.ModuleList()
+#         self.conv1 = ConvBasic(chanIn, interChans, k=5, s=1, p=2)
+#         layers.append(self.conv1)
+#         self.conv2 = ConvBasic(interChans, interChans, k=3, s=1, p=1)
+#         layers.append(self.conv2)
+#         self.conv3 = ConvBasic(interChans, last_conv_chan, k=3, s=1, p=1)
+#         layers.append(self.conv3)
+#         self.layers = layers
+#
+#         self.linear_dim = int(torch.prod(torch.tensor(self._get_linear_size(layers))))
+#         # print(f"Classif @ {self.bb_index} linear dim: {self.linear_dim}") #check linear dim
+#
+#         # linear layer
+#         self.linear = nn.Sequential(
+#             nn.Flatten(),
+#             nn.Linear(self.linear_dim, classes)
+#         )
+#
+#     def _get_linear_size(self, layers):
+#         for layer in layers:
+#             self.input_shape = get_output_shape(layer, self.input_shape)
+#         return self.input_shape
+#
+#     def forward(self, x):
+#         for layer in self.layers:
+#             x = layer(x)
+#         return self.linear(x)
 
 
 class ResNet_2EE(ResNet_backbone):
@@ -271,31 +277,31 @@ class ResNet_2EE(ResNet_backbone):
         self.exit_loss_weights = [1.0, 1.0]  # for training need to match total exits_num
         self.exit_threshold = torch.tensor([0.8],
                                            dtype=torch.float32)  # for fast inference  #TODO: inference variable(not constant 0.8) need to make parameter
-        self._build_exits()
+        # self._build_exits()
 
-    def _build_exits(self):  # adding early exits/branches
-        # TODO generalise exit placement for multi exit
-        # early exit 1
-        previous_shape = get_output_shape(self.init_conv, self.input_shape)
-        ee1 = IntrClassif(self.in_chan_sizes[0],
-                          # TODO: branch before conv2 ->conv_x//why before conv2 not after? beacasue author did it wtf..
-                          previous_shape, self.num_classes, 0)
-        self.exits.append(ee1)
-
-        # final exit
-        self.exits.append(self.end_layers)
+    # def _build_exits(self):  # adding early exits/branches
+    #     # TODO generalise exit placement for multi exit
+    #     # early exit 1
+    #     previous_shape = get_output_shape(self.init_conv, self.input_shape)
+    #     ee1 = IntrClassif(self.in_chan_sizes[0],
+    #                       # TODO: branch before conv2 ->conv_x//why before conv2 not after? beacasue author did it wtf..
+    #                       previous_shape, self.num_classes, 0)
+    #     self.exits.append(ee1)
+    #
+    #     # final exit
+    #     self.exits.append(self.end_layers)
 
     @torch.jit.unused  # decorator to skip jit comp
     def _forward_training(self, x):
         # TODO make jit compatible - not urgent
         # NOTE broken because returning list()
-        res = []
+        # res = []
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
         y = self.maxpool(x)
         # y = self.init_conv(x)
-        res.append(self.exits[0](y))
+        # res.append(self.exits[0](y))
         # compute remaining backbone layers
         # for b in self.backbone:
         #     y = b(y)
@@ -308,10 +314,12 @@ class ResNet_2EE(ResNet_backbone):
         for b in self.layer4:
             y = b(y)
         # final exit
-        y = self.end_layers(y)
-        res.append(y)
+        for b in self.end_layers:
+            y = b(y)
+        # y = self.end_layers(y)
+        # res.append(y)
 
-        return res
+        return y
 
     def exit_criterion_top1(self, x):  # NOT for batch size > 1 (in inference mode)
         with torch.no_grad():
@@ -333,9 +341,9 @@ class ResNet_2EE(ResNet_backbone):
             x = self.bn1(x)
             x = self.relu(x)
             y = self.maxpool(x)
-            res = self.exits[0](y)
-            if self.exit_criterion_top1(res):
-                return res
+            # res = self.exits[0](y)
+            # if self.exit_criterion_top1(res):
+            #     return res
             # compute remaining backbone layers
             # for b in self.backbone:
             #     y = b(y)
@@ -401,35 +409,33 @@ def resnet152_2EE():
     return ResNet_2EE(BottleNeck, [3, 8, 36, 3])
 
 
-
 if __name__ == "__main__":
-    #tracking the myResNet's parameter
+    # tracking the myResNet's parameter
     parameter_track_constatnt = 0
-    
-    script_dir = os.path.dirname(__file__) 
+
+    script_dir = os.path.dirname(__file__)
     pth_rel_path = "pretrained_model"
     file_name = "pretrained_resnet.pth"
     abs_file_path = os.path.join(script_dir, pth_rel_path)
     try:
         if not os.path.exists(abs_file_path):
             os.makedirs(abs_file_path)
-            
+
     except OSError:
-        print ('Error: Creating directory. ' +  abs_file_path)
+        print('Error: Creating directory. ' + abs_file_path)
     abs_file_path = os.path.join(abs_file_path, file_name)
-    resnet = torchvision.models.resnet101(weights = torchvision.models.ResNet101_Weights.IMAGENET1K_V1)
+    resnet = torchvision.models.resnet101(weights=torchvision.models.ResNet101_Weights.IMAGENET1K_V1)
     torch.save(resnet.state_dict(), abs_file_path)
     model = resnet101().to('cuda')
     model.load_state_dict(torch.load(abs_file_path))
-    
+
     if parameter_track_constatnt:
         log_rel_path = "parameter_log.txt"
         abs_file_path = os.path.join(script_dir, log_rel_path)
-        # 파일 열기
-        f=open(abs_file_path,'w')
-        # 파일에 텍스트 쓰기
+        #  파일 열기
+        f = open(abs_file_path, 'w')
+        #  파일에 텍스트 쓰기
         for param_tensor in model.state_dict():
-            f.write(f'{param_tensor} \t {model.state_dict()[param_tensor].size()}\n')    
-        # 파일 닫기
-        f.close()    
-    
+            f.write(f'{param_tensor} \t {model.state_dict()[param_tensor].size()}\n')
+            #  파일 닫기
+        f.close()

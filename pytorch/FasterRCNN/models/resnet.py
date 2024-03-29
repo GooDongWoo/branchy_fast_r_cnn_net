@@ -22,6 +22,7 @@ import torchvision
 
 from ..datasets import image
 from .backbone import Backbone
+from torchsummary import summary
 
 
 class Architecture(Enum):
@@ -78,7 +79,8 @@ class FeatureExtractor(nn.Module):
 
   def forward(self, image_data):
     y = self._feature_extractor(image_data)
-    return y
+    # print("res1 : ", y)
+    return y, y
 
   @staticmethod
   def _freeze(layer):
@@ -145,6 +147,10 @@ class ResNetBackbone(Backbone):
       resnet = torchvision.models.resnet50(weights = torchvision.models.ResNet50_Weights.IMAGENET1K_V1)
     elif architecture == Architecture.ResNet101:
       resnet = torchvision.models.resnet101(weights = torchvision.models.ResNet101_Weights.IMAGENET1K_V1)
+      # resnet = torchvision.models.resnet101()
+      resnet.cuda()
+      summary(resnet, (3, 32, 32), device='cuda')
+      t.save(resnet, './aaa.pth')
     elif architecture == Architecture.ResNet152:
       resnet = torchvision.models.resnet152(weights = torchvision.models.ResNet152_Weights.IMAGENET1K_V1)
     else:

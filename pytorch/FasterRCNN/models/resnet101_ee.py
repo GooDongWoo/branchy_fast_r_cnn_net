@@ -13,7 +13,10 @@
 #     Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun
 #
 
-from enum import Enum
+# from enum import Enums
+import sys
+import os
+
 from math import ceil
 import torch as t
 from torch import nn
@@ -22,14 +25,14 @@ import torchvision
 
 from ..datasets import image
 from .backbone import Backbone
-from .myResNet import ResNet_2EE, BottleNeck,  get_output_shape
+from .myResNet import ResNet_2EE, BottleNeck,  get_output_shape, resnet101
 from torchsummary import summary
 device = 'cuda'
 
-class Architecture(Enum):
-  ResNet50 = "ResNet50"
-  ResNet101 = "ResNet101"
-  ResNet152 = "ResNet152"
+# class Architecture(Enum):
+#   ResNet50 = "ResNet50"
+#   ResNet101 = "ResNet101"
+#   ResNet152 = "ResNet152"
 
 class ConvBasic(nn.Module):
     def __init__(self, chanIn, chanOut, k=3, s=1,
@@ -50,13 +53,11 @@ class IntrFE(nn.Module):
     # Inpsired by MSDNet classifiers (from HAPI):
     # https://github.com/kalviny/MSDNet-PyTorch/blob/master/models/msdnet.py
 
-    def __init__(self, chanIn, input_shape, classes, bb_index, interChans=64, last_conv_chan=32):
+    def __init__(self, chanIn, interChans=64, last_conv_chan=1024):
       super(IntrFE, self).__init__()
 
       # index for the position in the backbone layer
-      self.bb_index = bb_index
       # input shape to automatically size linear layer
-      self.input_shape = input_shape
 
       # intermediate conv channels
       # interChans = 128 # TODO reduce size for smaller nets
@@ -64,27 +65,13 @@ class IntrFE(nn.Module):
       self.last_conv_chan = last_conv_chan
       # conv, bnorm, relu 1
       layers = nn.ModuleList()
-      self.conv1 = ConvBasic(chanIn, interChans, k=5, s=1, p=2)
+      self.conv1 = ConvBasic(chanIn, interChans, k=5, s=2, p=2)
       layers.append(self.conv1)
-      self.conv2 = ConvBasic(interChans, interChans, k=3, s=1, p=1)
+      self.conv2 = ConvBasic(interChans, interChans, k=3, s=2, p=1)
       layers.append(self.conv2)
       self.conv3 = ConvBasic(interChans, last_conv_chan, k=3, s=1, p=1)
       layers.append(self.conv3)
       self.layers = layers
-
-      # self.linear_dim = int(torch.prod(torch.tensor(self._get_linear_size(layers))))
-      # # print(f"Classif @ {self.bb_index} linear dim: {self.linear_dim}") #check linear dim
-      #
-      # # linear layer
-      # self.linear = nn.Sequential(
-      #   nn.Flatten(),
-      #   nn.Linear(self.linear_dim, classes)
-      # )
-
-    def _get_linear_size(self, layers):
-      for layer in layers:
-        self.input_shape = get_output_shape(layer, self.input_shape)
-      return self.input_shape
 
     def forward(self, x):
       for layer in self.layers:
@@ -94,13 +81,17 @@ class IntrFE(nn.Module):
 class FeatureExtractor(nn.Module):
   def __init__(self, resnet):
     super().__init__()
-    self.conv1 = resnet.conv1
-    self.bn1 = resnet.bn1
-    self.relu = resnet.relu
-    self.maxpool = resnet.maxpool
-    self.layer1 = resnet.layer1
-    self.layer2 = resnet.layer2
-    self.layer3 = resnet.layer3
+    self._feature_extractor1 = nn.Sequential(
+      resnet.conv1,     # 0
+      resnet.bn1,       # 1
+      resnet.relu,      # 2
+      resnet.maxpool   # 3
+    )
+    self._feature_extractor2 = nn.Sequential(
+      resnet.layer1,    # 4
+      resnet.layer2,    # 5
+      # resnet.layer3     # 6
+    )
 
     # create exit by FE(Feature Extractor)
     self.exits = nn.ModuleList()
@@ -111,19 +102,16 @@ class FeatureExtractor(nn.Module):
     self._build_exits(resnet)
 
     # Freeze initial layers
-    self._freeze(self.conv1)
-    self._freeze(self.bn1)
-    self._freeze(self.layer1)
+    self._freeze(resnet.conv1)
+    self._freeze(resnet.bn1)
+    self._freeze(resnet.layer1)
 
     # Ensure that all batchnorm layers are frozen, as described in Appendix A
     # of [1]
-    self._freeze_batchnorm(self.conv1)
-    self._freeze_batchnorm(self.bn1)
-    self._freeze_batchnorm(self.relu)
-    self._freeze_batchnorm(self.maxpool)
-    self._freeze_batchnorm(self.layer1)
-    self._freeze_batchnorm(self.layer2)
-    self._freeze_batchnorm(self.layer3)
+    self._freeze_batchnorm(self._feature_extractor1)
+    self._freeze_batchnorm(self._feature_extractor2)
+    self._freeze_batchnorm(self.exits[0])
+    self._freeze_batchnorm(self.exits[1])
 
   # Override nn.Module.train()
   def train(self, mode = True):
@@ -137,57 +125,33 @@ class FeatureExtractor(nn.Module):
     #
     if mode:
       # Set fixed blocks to be in eval mode
-      self.conv1.eval()
-      self.bn1.eval()
-      self.relu.eval()
-      self.maxpool.eval()
-      self.layer1.eval()
-      self.layer2.eval()
-      self.layer3.eval()
+      if mode:
+        # Set fixed blocks to be in eval mode
+        self._feature_extractor1.eval()
+        self._feature_extractor2.eval()
+        self._feature_extractor2[1].train()
+        self.exits[1].train()
 
-      self.layer2.train()
-      self.layer3.train()
+        # *All* batchnorm layers in eval mode
+        def set_bn_eval(module):
+          if type(module) == nn.BatchNorm2d:
+            module.eval()
 
-      # *All* batchnorm layers in eval mode
-      def set_bn_eval(module):
-        if type(module) == nn.BatchNorm2d:
-          module.eval()
-      self.conv1.apply(set_bn_eval)
-      self.bn1.apply(set_bn_eval)
-      self.relu.apply(set_bn_eval)
-      self.maxpool.apply(set_bn_eval)
-      self.layer1.apply(set_bn_eval)
-      self.layer2.apply(set_bn_eval)
-      self.layer3.apply(set_bn_eval)
-
-
-
-
-  def exit_criterion_top1(self, x):  # NOT for batch size > 1 (in inference mode)
-    with t.no_grad():
-      pk = nn.functional.softmax(x, dim=-1).to('cuda')
-      top1 = t.log(pk) * pk
-      return (top1 < self.exit_threshold).cpu().detach().numpy()
-
-
+        self._feature_extractor1.apply(set_bn_eval)
+        self._feature_extractor2.apply(set_bn_eval)
 
 
   def forward(self, image_data):
-    res  =[]
-    x = self.conv1(image_data)
-    x = self.bn1(x)
-    x = self.relu(x)
-    y = self.maxpool(x)
+    res = []
+
+    y = self._feature_extractor1(image_data)
     res.append(self.exits[0](y))
-    # if self.exit_criterion_top1(res):
-    #   return res
-    for b in self.layer1:
-      y = b(y)
-    for b in self.layer2:
-      y = b(y)
+
+    y = self._feature_extractor2(y)
     res.append(self.exits[1](y))
-    # print("res : ", res.shape)
-    return res[1]
+    # print(res[0])
+    # print(res[1])
+    return res[0], res[1]
 
 
   @staticmethod
@@ -202,15 +166,11 @@ class FeatureExtractor(nn.Module):
 
   def _build_exits(self, resnet):
     # input shape ? does it have to be fixxed?
-    previous_shape = get_output_shape(resnet.init_conv, resnet.input_shape)
-    ee1 = IntrFE(resnet.in_chan_sizes[0],
-                      # TODO: branch before conv2 ->conv_x//why before conv2 not after? beacasue author did it wtf..
-                      previous_shape, resnet.num_classes, 0)
-    # ee1 = nn.Sequential(self.layer3)
+    ee1 = IntrFE(64)
     self.exits.append(ee1)
 
     # final exit
-    self.exits.append(self.layer3)
+    self.exits.append(resnet.layer3)
 
 
 class PoolToFeatureVector(nn.Module):
@@ -263,13 +223,26 @@ class ResNetBackbone(Backbone):
     self.image_preprocessing_params = image.PreprocessingParams(channel_order = image.ChannelOrder.RGB, scaling = 1.0 / 255.0, means = [ 0.485, 0.456, 0.406 ], stds = [ 0.229, 0.224, 0.225 ])
 
     # Construct model and pre-load with ImageNet weights
-    if architecture == Architecture.ResNet101:
-      resnet = ResNet_2EE(BottleNeck, [3, 4, 23, 3])
-      resnet.to('cuda')
-      summary(resnet, (3, 32, 32), device='cuda')
+    if architecture == "ResNet101":
+      script_dir = os.path.dirname(__file__)
+      pth_rel_path = "pretrained_model"
+      file_name = "pretrained_resnet.pth"
+      abs_file_path = os.path.join(script_dir, pth_rel_path)
+      try:
+        if not os.path.exists(abs_file_path):
+          os.makedirs(abs_file_path)
+      except OSError:
+        print('Error: Creating directory. ' + abs_file_path)
+      abs_file_path = os.path.join(abs_file_path, file_name)
+      resnet_a = torchvision.models.resnet101(weights=torchvision.models.ResNet101_Weights.IMAGENET1K_V1)
+      t.save(resnet_a.state_dict(), abs_file_path)
+      resnet = resnet101().to('cuda')
+      resnet.load_state_dict(t.load(abs_file_path))
+      # summary(resnet, (3, 32, 32), device='cuda')
+
     else:
       raise ValueError("Invalid ResNet architecture value: %s" % architecture.value)
-    print("Loaded IMAGENET1K_V1 pre-trained weights for Torchvision %s backbone" % architecture.value)
+    # print("Loaded IMAGENET1K_V1 pre-trained weights for Torchvision %s backbone" % architecture.value)
 
     # Feature extractor: given image data of shape (batch_size, channels, height, width),
     # produces a feature map of shape (batch_size, 1024, ceil(height/16), ceil(width/16))
