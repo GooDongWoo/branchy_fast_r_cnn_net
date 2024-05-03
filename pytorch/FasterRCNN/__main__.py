@@ -21,7 +21,9 @@
 import argparse
 import os
 import torch as t
+import torch.nn as nn
 from tqdm import tqdm
+from torchsummary import summary
 
 from .datasets import voc
 from .models.faster_rcnn import FasterRCNNModel
@@ -34,6 +36,10 @@ from .statistics import PrecisionRecallCurveCalculator
 from . import state
 from . import utils
 from . import visualize
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
+device = t.device("cuda" if t.cuda.is_available() else "cpu")
+
 
 
 def render_anchors(backbone):
@@ -65,9 +71,9 @@ def evaluate(model, eval_data = None, num_samples = None, plot = False, print_av
     eval_data = voc.Dataset(
       dir=options.dataset_dir,
       split=options.eval_split,
-      image_preprocessing_params=model.backbone.image_preprocessing_params,
-      compute_feature_map_shape_fn=model.backbone.compute_feature_map_shape,
-      feature_pixels=model.backbone.feature_pixels,
+      image_preprocessing_params=model.module.backbone.image_preprocessing_params,
+      compute_feature_map_shape_fn=model.module.backbone.compute_feature_map_shape,
+      feature_pixels=model.module.backbone.feature_pixels,
       augment=False,
       shuffle=False,
       cache=False
@@ -78,7 +84,7 @@ def evaluate(model, eval_data = None, num_samples = None, plot = False, print_av
   i = 0
   print("Evaluating '%s'..." % eval_data.split)
   for sample in tqdm(iterable = iter(eval_data), total = num_samples):
-    scored_boxes_by_class_index = model.predict(
+    scored_boxes_by_class_index = model.module.predict(
       image_data = t.from_numpy(sample.image_data).unsqueeze(dim = 0).cuda(),
       score_threshold = 0.05  # lower threshold for evaluation
     )
@@ -102,9 +108,9 @@ def evaluate_ee(model, eval_data = None, num_samples = None, plot = False, print
     eval_data = voc.Dataset(
       dir=options.dataset_dir,
       split=options.eval_split,
-      image_preprocessing_params=model.backbone.image_preprocessing_params,
-      compute_feature_map_shape_fn=model.backbone.compute_feature_map_shape,
-      feature_pixels=model.backbone.feature_pixels,
+      image_preprocessing_params=model.module.backbone.image_preprocessing_params,
+      compute_feature_map_shape_fn=model.module.backbone.compute_feature_map_shape,
+      feature_pixels=model.module.backbone.feature_pixels,
       augment=False,
       shuffle=False,
       cache=False
@@ -115,7 +121,7 @@ def evaluate_ee(model, eval_data = None, num_samples = None, plot = False, print
   i = 0
   print("Evaluating '%s'..." % eval_data.split)
   for sample in tqdm(iterable = iter(eval_data), total = num_samples):
-    scored_boxes_by_class_index = model.predict_ee(
+    scored_boxes_by_class_index = model.module.predict_ee(
       image_data = t.from_numpy(sample.image_data).unsqueeze(dim = 0).cuda(),
       score_threshold = 0.05  # lower threshold for evaluation
     )
@@ -183,9 +189,9 @@ def train(model):
   training_data = voc.Dataset(
     dir = options.dataset_dir,
     split = options.train_split,
-    image_preprocessing_params = model.backbone.image_preprocessing_params,
-    compute_feature_map_shape_fn = model.backbone.compute_feature_map_shape,
-    feature_pixels = model.backbone.feature_pixels,
+    image_preprocessing_params = model.module.backbone.image_preprocessing_params,
+    compute_feature_map_shape_fn = model.module.backbone.compute_feature_map_shape,
+    feature_pixels = model.module.backbone.feature_pixels,
     augment = not options.no_augment,
     shuffle = True,
     cache = options.cache_images
@@ -193,9 +199,9 @@ def train(model):
   eval_data = voc.Dataset(
     dir = options.dataset_dir,
     split = options.eval_split,
-    image_preprocessing_params = model.backbone.image_preprocessing_params,
-    compute_feature_map_shape_fn = model.backbone.compute_feature_map_shape,
-    feature_pixels = model.backbone.feature_pixels,
+    image_preprocessing_params = model.module.backbone.image_preprocessing_params,
+    compute_feature_map_shape_fn = model.module.backbone.compute_feature_map_shape,
+    feature_pixels = model.module.backbone.feature_pixels,
     augment = False,
     shuffle = False,
     cache = False
@@ -208,12 +214,12 @@ def train(model):
   if options.save_best_to:
     best_weights_tracker = state.BestWeightsTracker(filepath = options.save_best_to)
   for epoch in range(1, 1 + options.epochs):
-    print("Epoch %d/%d" % (epoch, options.epochs))
+    #print("Epoch %d/%d" % (epoch, options.epochs))
     stats = TrainingStatistics()
     progbar = tqdm(iterable = iter(training_data), total = training_data.num_samples, postfix = stats.get_progbar_postfix())
     for sample in progbar:
       if epoch % 2 == 0:
-        loss = model.train_step(  # don't retain any tensors we don't need (helps memory usage)
+        loss = model.module.train_step_ALL(  # don't retain any tensors we don't need (helps memory usage)
         optimizer = optimizer,
         image_data = t.from_numpy(sample.image_data).unsqueeze(dim = 0).cuda(),
         anchor_map = sample.anchor_map,
@@ -224,7 +230,7 @@ def train(model):
         gt_boxes = [ sample.gt_boxes ]
         )
       else:
-        loss = model.train_step_ee(  # don't retain any tensors we don't need (helps memory usage)
+        loss = model.module.train_step_ALL(  # don't retain any tensors we don't need (helps memory usage)
           optimizer=optimizer,
           image_data=t.from_numpy(sample.image_data).unsqueeze(dim=0).cuda(),
           anchor_map=sample.anchor_map,
@@ -237,6 +243,13 @@ def train(model):
       stats.on_training_step(loss = loss)
       progbar.set_postfix(stats.get_progbar_postfix())
     last_epoch = epoch == options.epochs
+    mean_average_precision = evaluate_ee(
+      model = model,
+      eval_data = eval_data,
+      num_samples = options.periodic_eval_samples,
+      plot = False,
+      print_average_precisions = False
+    )
     mean_average_precision = evaluate(
       model = model,
       eval_data = eval_data,
@@ -246,7 +259,7 @@ def train(model):
     )
     if options.checkpoint_dir:
       checkpoint_file = os.path.join(options.checkpoint_dir, "checkpoint-epoch-%d-mAP-%1.1f.pth" % (epoch, mean_average_precision))
-      t.save({ "epoch": epoch, "model_state_dict": model.state_dict() }, checkpoint_file)
+      t.save({ "epoch": epoch, "model_state_dict": model.module.state_dict() }, checkpoint_file)
       print("Saved model checkpoint to '%s'" % checkpoint_file)
     if options.log_csv:
       log_items = {
@@ -262,11 +275,18 @@ def train(model):
     if options.save_best_to:
       best_weights_tracker.on_epoch_end(model = model, epoch = epoch, mAP = mean_average_precision)
   if options.save_to:
-    t.save({ "epoch": epoch, "model_state_dict": model.state_dict() }, options.save_to)
+    t.save({ "epoch": epoch, "model_state_dict": model.module.state_dict() }, options.save_to)
     print("Saved final model weights to '%s'" % options.save_to)
   if options.save_best_to:
     best_weights_tracker.save_best_weights(model = model)
   print("Evaluating %s model on all samples in '%s'..." % (("best" if options.save_best_to else "final"), options.eval_split))  # evaluate final or best model on full dataset
+  evaluate_ee(
+    model = model,
+    eval_data = eval_data,
+    num_samples = eval_data.num_samples,  # use all samples
+    plot = options.plot,
+    print_average_precisions = True
+  )
   evaluate(
     model = model,
     eval_data = eval_data,
@@ -277,7 +297,7 @@ def train(model):
 
 def predict(model, image_data, image, show_image, output_path):
   image_data = t.from_numpy(image_data).unsqueeze(dim = 0).cuda()
-  scored_boxes_by_class_index = model.predict(image_data = image_data, score_threshold = 0.7)
+  scored_boxes_by_class_index = model.module.predict(image_data = image_data, score_threshold = 0.7)
   visualize.show_detections(
     output_path = output_path,
     show_image = show_image,
@@ -288,7 +308,7 @@ def predict(model, image_data, image, show_image, output_path):
 
 def predict_ee(model, image_data, image, show_image, output_path):
   image_data = t.from_numpy(image_data).unsqueeze(dim = 0).cuda()
-  scored_boxes_by_class_index = model.predict_ee(image_data = image_data, score_threshold = 0.7)
+  scored_boxes_by_class_index = model.module.predict_ee(image_data = image_data, score_threshold = 0.7)
   visualize.show_detections(
     output_path = output_path,
     show_image = show_image,
@@ -299,7 +319,7 @@ def predict_ee(model, image_data, image, show_image, output_path):
 
 def predict_one(model, url, show_image, output_path):
   from .datasets import image
-  image_data, image_obj, _, _ = image.load_image(url = url, preprocessing = model.backbone.image_preprocessing_params, min_dimension_pixels = 600)
+  image_data, image_obj, _, _ = image.load_image(url = url, preprocessing = model.module.backbone.image_preprocessing_params, min_dimension_pixels = 600)
   predict(model = model, image_data = image_data, image = image_obj, show_image = show_image, output_path = output_path)
 
 def predict_all(model, split):
@@ -310,9 +330,9 @@ def predict_all(model, split):
   dataset = voc.Dataset(
     dir = options.dataset_dir,
     split = split,
-    image_preprocessing_params = model.backbone.image_preprocessing_params,
-    compute_feature_map_shape_fn = model.backbone.compute_feature_map_shape,
-    feature_pixels = model.backbone.feature_pixels,
+    image_preprocessing_params = model.module.backbone.image_preprocessing_params,
+    compute_feature_map_shape_fn = model.module.backbone.compute_feature_map_shape,
+    feature_pixels = model.module.backbone.feature_pixels,
     augment = False,
     shuffle = False
   )
@@ -327,9 +347,9 @@ def predict_all_ee(model, split):
   dataset = voc.Dataset(
     dir = options.dataset_dir,
     split = split,
-    image_preprocessing_params = model.backbone.image_preprocessing_params,
-    compute_feature_map_shape_fn = model.backbone.compute_feature_map_shape,
-    feature_pixels = model.backbone.feature_pixels,
+    image_preprocessing_params = model.module.backbone.image_preprocessing_params,
+    compute_feature_map_shape_fn = model.module.backbone.compute_feature_map_shape,
+    feature_pixels = model.module.backbone.feature_pixels,
     augment = False,
     shuffle = False
   )
@@ -398,19 +418,24 @@ if __name__ == "__main__":
     backbone = backbone,
     allow_edge_proposals = not options.exclude_edge_proposals
   ).cuda()
+  model = nn.DataParallel(model, device_ids=[0,1,2]).to(device)
+  
+  #summary(model, (1, 32, 32), device='cuda')
   if options.load_from:
     state.load(model = model, filepath = options.load_from)
+
 
   # Perform mutually exclusive procedures
   if options.train:
     train(model = model)
+    
   elif options.eval:
     eval_data = voc.Dataset(
       dir=options.dataset_dir,
       split=options.eval_split,
-      image_preprocessing_params=model.backbone.image_preprocessing_params,
-      compute_feature_map_shape_fn=model.backbone.compute_feature_map_shape,
-      feature_pixels=model.backbone.feature_pixels,
+      image_preprocessing_params=model.module.backbone.image_preprocessing_params,
+      compute_feature_map_shape_fn=model.module.backbone.compute_feature_map_shape,
+      feature_pixels=model.module.backbone.feature_pixels,
       augment=False,
       shuffle=False,
       cache=False
@@ -426,9 +451,9 @@ if __name__ == "__main__":
     eval_data = voc.Dataset(
       dir=options.dataset_dir,
       split=options.eval_split,
-      image_preprocessing_params=model.backbone.image_preprocessing_params,
-      compute_feature_map_shape_fn=model.backbone.compute_feature_map_shape,
-      feature_pixels=model.backbone.feature_pixels,
+      image_preprocessing_params=model.module.backbone.image_preprocessing_params,
+      compute_feature_map_shape_fn=model.module.backbone.compute_feature_map_shape,
+      feature_pixels=model.module.backbone.feature_pixels,
       augment=False,
       shuffle=False,
       cache=False
