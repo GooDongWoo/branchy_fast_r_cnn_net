@@ -25,15 +25,21 @@ import torch.nn as nn
 from tqdm import tqdm
 from torchsummary import summary
 
-from .datasets import voc
-from .models.faster_rcnn import FasterRCNNModel
-from .models import resnet
-from .models import resnet101_ee
-from .statistics import TrainingStatistics
-from .statistics import PrecisionRecallCurveCalculator
-from . import state
-from . import utils
-from . import visualize
+if __name__=='__main__':
+  import sys
+  dir_path = os.path.dirname(os.path.realpath(__file__))
+  dir_path = os.path.split(dir_path)[:-1][0]
+  sys.path.append(dir_path)
+  
+from _datasets import voc
+from _models.faster_rcnn import FasterRCNNModel
+from _models import resnet
+from _models import resnet101_ee
+from statistics import TrainingStatistics
+from statistics import PrecisionRecallCurveCalculator
+import state
+import utils
+import visualize
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 device = t.device("cuda" if t.cuda.is_available() else "cpu")
@@ -149,7 +155,7 @@ def create_optimizer(model):
   return t.optim.SGD(params, lr = options.learning_rate, momentum = options.momentum)
 
 def enable_cuda_memory_profiler(model):
-  from pytorch.FasterRCNN import profile
+  import profile
   import sys
   import threading
   memory_profiler = profile.CUDAMemoryProfiler([ model ], filename = "cuda_memory.txt")
@@ -302,7 +308,7 @@ def predict_ee(model, image_data, image, show_image, output_path):
   )
 
 def predict_one(model, url, show_image, output_path):
-  from .datasets import image
+  from datasets import image
   image_data, image_obj, _, _ = image.load_image(url = url, preprocessing = model.backbone.image_preprocessing_params, min_dimension_pixels = 600)
   predict(model = model, image_data = image_data, image = image_obj, show_image = show_image, output_path = output_path)
 
@@ -344,15 +350,15 @@ def predict_all_ee(model, split):
 if __name__ == "__main__":
   parser = argparse.ArgumentParser("FasterRCNN")
   group = parser.add_mutually_exclusive_group()
-  group.add_argument("--train", action = "store_true", help = "Train model")
-  group.add_argument("--eval", action = "store_true", help = "Evaluate model")
-  group.add_argument("--eval_ee", action="store_true", help="Evaluate model")
-  group.add_argument("--predict", metavar = "url", action = "store", type = str, help = "Run inference on image and display detected boxes")
-  group.add_argument("--predict-to-file", metavar = "url", action = "store", type = str, help = "Run inference on image and render detected boxes to 'predictions.png'")
-  group.add_argument("--predict-all", metavar = "name", action = "store", type = str, help = "Run inference on all images in the specified dataset split and write to directory 'predictions_${split}'")
-  group.add_argument("--predict-all_ee", metavar="name", action="store", type=str, help="Run inference on all images in the specified dataset split and write to directory 'predictions_${split}'")
+  group.add_argument("--train", action = "store_true", default=True, help = "Train model")
+  # group.add_argument("--eval", action = "store_true", help = "Evaluate model")
+  # group.add_argument("--eval_ee", action="store_true", help="Evaluate model")
+  # group.add_argument("--predict", metavar = "url", action = "store", type = str, help = "Run inference on image and display detected boxes")
+  # group.add_argument("--predict-to-file", metavar = "url", action = "store", type = str, help = "Run inference on image and render detected boxes to 'predictions.png'")
+  # group.add_argument("--predict-all", metavar = "name", action = "store", type = str, help = "Run inference on all images in the specified dataset split and write to directory 'predictions_${split}'")
+  # group.add_argument("--predict-all_ee", metavar="name", action="store", type=str, help="Run inference on all images in the specified dataset split and write to directory 'predictions_${split}'")
   parser.add_argument("--load-from", metavar = "file", action = "store", help = "Load initial model weights from file")
-  parser.add_argument("--backbone", metavar = "model", action = "store", default = "vgg16", help = "Backbone model for feature extraction and classification")
+  parser.add_argument("--backbone", metavar = "model", action = "store", default = "resnet101", help = "Backbone model for feature extraction and classification")
   parser.add_argument("--save-to", metavar = "file", action = "store", help = "Save final trained weights to file")
   parser.add_argument("--save-best-to", metavar = "file", action = "store", help = "Save best weights (highest mean average precision) to file")
   parser.add_argument("--dataset-dir", metavar = "dir", action = "store", default = "VOCdevkit/VOC2007", help = "VOC dataset directory")

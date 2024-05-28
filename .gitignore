@@ -1,2 +1,5 @@
 __pycache__
 
+*VOCdevkit*
+*.pth
+aaa.pth
